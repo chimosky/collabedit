@@ -16,13 +16,12 @@
 # Foundation, 51 Franklin Street, Suite 500 Boston, MA 02110-1335 USA
 
 '''
-The wrapper module provides an abstraction over the sugar
+The wrapper module provides an abstraction over the Sugar
 collaboration system.
 
 Using CollabWrapper
 -------------------
-1. Implement the `get_data` and `set_data` methods in your activity
-   class::
+1. Add `get_data` and `set_data` methods to the activity class::
 
     def get_data(self):
         # return plain python objects - things that can be encoded
@@ -35,19 +34,19 @@ Using CollabWrapper
         # data will be the same object returned by get_data
         self._entry.set_text(data.get('text'))
 
-2. Make your CollabWrapper instance::
+2. Make a CollabWrapper instance::
 
     def __init__(self, handle):
         sugar3.activity.activity.Activity.__init__(self, handle)
         self._collab = CollabWrapper(self)
         self._collab.connect('message', self.__message_cb)
 
-        # setup your activity
+        # setup your activity here
 
         self._collab.setup()
 
-3. Post any changes to the CollabWrapper.  The changes will be sent to
-   other users if any are connected::
+3. Post any changes of shared state to the CollabWrapper.  The changes
+   will be sent to other buddies if any are connected, for example::
 
     def __entry_changed_cb(self, *args):
         self._collab.post(dict(
@@ -55,9 +54,9 @@ Using CollabWrapper
             new_text=self._entry.get_text()
         ))
 
-4. Handle incoming messages::
+4. Handle incoming messages, for example::
 
-    def __message_cb(self, collab, buddy, message):
+    def __message_cb(self, collab, buddy, msg):
         action = msg.get('action')
         if action == 'entry_changed':
             self._entry.set_text(msg.get('new_text'))
@@ -69,26 +68,17 @@ import json
 import socket
 from gettext import gettext as _
 
+import gi
+gi.require_version('TelepathyGLib', '0.12')
 from gi.repository import GObject
 from gi.repository import Gio
 from gi.repository import GLib
+from gi.repository import TelepathyGLib
 import dbus
 
-from telepathy.interfaces import \
-    CHANNEL_INTERFACE, \
-    CHANNEL_INTERFACE_GROUP, \
-    CHANNEL_TYPE_TEXT, \
-    CHANNEL_TYPE_FILE_TRANSFER, \
-    CONN_INTERFACE_ALIASING, \
-    CHANNEL, \
-    CLIENT
-from telepathy.constants import \
-    CHANNEL_GROUP_FLAG_CHANNEL_SPECIFIC_HANDLES, \
-    CONNECTION_HANDLE_TYPE_CONTACT, \
-    CHANNEL_TEXT_MESSAGE_TYPE_NORMAL, \
-    SOCKET_ADDRESS_TYPE_UNIX, \
-    SOCKET_ACCESS_CONTROL_LOCALHOST
-from telepathy.client import Connection, Channel
+from gi.repository.TelepathyGLib import Connection,\
+    Channel,\
+    ChannelTextMessageType
 
 from sugar3.presence import presenceservice
 from sugar3.activity.activity import SCOPE_PRIVATE
@@ -104,36 +94,53 @@ ACTIVITY_FT_MIME = 'x-sugar/from-activity'
 
 class CollabWrapper(GObject.GObject):
     '''
-    The collaboration wrapper provides a high level abstraction over the
-    collaboration system.  The wrapper deals with setting up the channels,
-    encoding and decoding messages, initialization and alerting the user
-    to the status.
+    The wrapper provides a high level abstraction over the
+    collaboration system.  The wrapper deals with setting up the
+    channels, encoding and decoding messages, initialization and
+    alerting the caller to the status.
 
-    When a user joins the activity, it will query the leader for the
-    contents.  The leader will return the result of the activity's
-    `get_data` function which will be passed to the `set_data` function
-    on the new user's computer.
+    An activity instance is initially private, but may be shared.  Once
+    shared, an instance will remain shared for as long as the activity
+    runs.  On stop, the journal will preserve the instance as shared,
+    and on resume the instance will be shared again.
 
-    The `message` signal is called when a message is received from a
-    buddy.  It has 2 arguments.  The first is the buddy, as a
-    :class:`sugar3.presence.buddy.Buddy`. The second is the decoded
-    content of the message, same as that posted by the other instance.
+    When the caller shares an activity instance, they are the leader,
+    and other buddies may join.  The instance is now a shared activity.
 
-    The `joined` signal is emitted when the buddy joins a running
-    activity.  If the user shares and activity, the joined signal
-    is not emitted.  By the time this signal is emitted, the channels
-    will be setup so all messages will flow through.
+    When the caller joins a shared activity, the leader will call
+    `get_data`, and the caller's `set_data` will be called with the
+    result.
 
-    The `buddy_joined` and `buddy_left` signals are emitted when
-    another user joins or leaves the activity.  They both a
-    :class:`sugar3.presence.buddy.Buddy` as their only argument.
+    The `joined` signal is emitted when the caller joins a shared
+    activity.  One or more `buddy_joined` signals will be emitted before
+    this signal.  The signal is not emitted to the caller who first
+    shared the activity.  There are no arguments.
+
+    The `buddy_joined` signal is emitted when another buddy joins the
+    shared activity.  At least one will be emitted before the `joined`
+    signal.  The caller will never be mentioned, but is assumed to be
+    part of the set.  The signal passes a
+    :class:`sugar3.presence.buddy.Buddy` as the only argument.
+
+    The `buddy_left` signal is emitted when another user leaves the
+    shared activity.  The signal is not emitted during quit.  The signal
+    passes a :class:`sugar3.presence.buddy.Buddy` as the only argument.
+
+    Any buddy may call `post` to send a message to all buddies.  Each
+    buddy will receive a `message` signal.
+
+    The `message` signal is emitted when a `post` is received from any
+    buddy.  The signal has two arguments.  The first is a
+    :class:`sugar3.presence.buddy.Buddy`. The second is the message.
+
+    Any buddy may call `send_file_memory` or `send_file_file` to
+    transfer a file to all buddies.  A description is to be given.
+    Each buddy will receive an `incoming_file` signal.
 
     The `incoming_file` signal is emitted when a file transfer is
-    received from a buddy.  The first argument is the object representing
-    the transfer, as a
-    :class:`sugar3.presence.filetransfer.IncomingFileTransfer`.  The seccond
-    argument is the description, as passed to the `send_file_*` function
-    on the sender's client
+    received.  The signal has two arguments.  The first is a
+    :class:`sugar3.presence.filetransfer.IncomingFileTransfer`.  The
+    second is the description.
     '''
 
     message = GObject.Signal('message', arg_types=[object, object])
@@ -152,14 +159,14 @@ class CollabWrapper(GObject.GObject):
 
     def setup(self):
         '''
-        Setup must be called to so that the activity can join or share
+        Setup must be called so that the activity can join or share
         if appropriate.
 
         .. note::
             As soon as setup is called, any signal, `get_data` or
-            `set_data` call must be made.  This means that your
-            activity must have set up enough so these functions can
-            work.  For example, place this at the end of the activity's
+            `set_data` call may occur.  This means that the activity
+            must have set up enough so these functions can work.  For
+            example, call setup at the end of the activity
             `__init__` function.
         '''
         # Some glue to know if we are launching, joining, or resuming
@@ -215,6 +222,9 @@ class CollabWrapper(GObject.GObject):
         self._init_waiting = True
         self.post({'action': ACTION_INIT_REQUEST})
 
+        for buddy in self.shared_activity.get_joined_buddies():
+            self.buddy_joined.emit(buddy)
+
         _logger.debug('I joined a shared activity.')
         self.joined.emit()
 
@@ -240,11 +250,11 @@ class CollabWrapper(GObject.GObject):
     def __new_channels_cb(self, channels):
         conn = self.shared_activity.telepathy_conn
         for path, props in channels:
-            if props[CHANNEL + '.Requested']:
+            if props[TelepathyGLib.IFACE_CHANNEL + '.Requested']:
                 continue  # This channel was requested by me
 
-            channel_type = props[CHANNEL + '.ChannelType']
-            if channel_type == CHANNEL_TYPE_FILE_TRANSFER:
+            channel_type = props[TelepathyGLib.IFACE_CHANNEL + '.ChannelType']
+            if channel_type == TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER:
                 self._handle_ft_channel(conn, path, props)
 
     def _handle_ft_channel(self, conn, path, props):
@@ -292,16 +302,16 @@ class CollabWrapper(GObject.GObject):
 
     def send_file_memory(self, buddy, data, description):
         '''
-        Send a 1-to-1 transfer from memory to a given buddy.  They will
-        get the file transfer and description through the `incoming_transfer`
-        signal.
+        Send a one to one file transfer from memory to a buddy.  The
+        buddy will get the file transfer and description through the
+        `incoming_transfer` signal.
 
         Args:
-            buddy (sugar3.presence.buddy.Buddy), buddy to offer the transfer to
-            data (str), the data to offer to the buddy via the transfer
+            buddy (sugar3.presence.buddy.Buddy), buddy to send to.
+            data (str), the data to send.
             description (object), a json encodable description for the
-                transfer.  This will be given to the `incoming_transfer` signal
-                of the transfer
+                transfer.  This will be given to the
+                `incoming_transfer` signal at the buddy.
         '''
         OutgoingBlobTransfer(
             buddy,
@@ -313,16 +323,16 @@ class CollabWrapper(GObject.GObject):
 
     def send_file_file(self, buddy, path, description):
         '''
-        Send a 1-to-1 transfer from a file to a given buddy.  They will
-        get the file transfer and description through the `incoming_transfer`
-        signal.
+        Send a one to one file transfer from a filesystem path to a
+        given buddy.  The buddy will get the file transfer and
+        description through the `incoming_transfer` signal.
 
         Args:
-            buddy (sugar3.presence.buddy.Buddy), buddy to offer the transfer to
-            path (str), path of the file to send to the buddy
+            buddy (sugar3.presence.buddy.Buddy), buddy to send to.
+            path (str), path of the file containing the data to send.
             description (object), a json encodable description for the
-                transfer.  This will be given to the `incoming_transfer` signal
-                of the transfer
+                transfer.  This will be given to the
+                `incoming_transfer` signal at the buddy.
         '''
         OutgoingFileTransfer(
             buddy,
@@ -334,13 +344,12 @@ class CollabWrapper(GObject.GObject):
 
     def post(self, msg):
         '''
-        Broadcast a message to the other buddies if the activity is
-        shared.  If it is not shared, the message will not be send
-        at all.
+        Send a message to all buddies.  If the activity is not shared,
+        no message is sent.
 
         Args:
-            msg (object): json encodable object to send to the other
-                buddies, eg. :class:`dict` or :class:`str`.
+            msg (object): json encodable object to send,
+                eg. :class:`dict` or :class:`str`.
         '''
         if self._text_channel is not None:
             self._text_channel.post(msg)
@@ -359,17 +368,16 @@ class CollabWrapper(GObject.GObject):
 
         Returns: str, telepathy client name
         '''
-        return CLIENT + '.' + self.activity.get_bundle_id()
+        return TelepathyGLib.IFACE_CLIENT + '.' + self.activity.get_bundle_id()
 
     @GObject.property
     def leader(self):
         '''
         Boolean of if this client is the leader in this activity.  The
         way the leader is decided may change, however there should only
-        ever be 1 leader for an activity.
+        ever be one leader for an activity.
         '''
         return self._leader
-
 
 FT_STATE_NONE = 0
 FT_STATE_PENDING = 1
@@ -425,16 +433,19 @@ class _BaseFileTransfer(GObject.GObject):
         should only be used by direct subclasses of the base file transfer.
         '''
         self.channel = channel
-        self.channel[CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
-            'FileTransferStateChanged', self.__state_changed_cb)
-        self.channel[CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
-            'TransferredBytesChanged', self.__transferred_bytes_changed_cb)
-        self.channel[CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
-            'InitialOffsetDefined', self.__initial_offset_defined_cb)
+        self.channel[
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
+                'FileTransferStateChanged', self.__state_changed_cb)
+        self.channel[
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
+                'TransferredBytesChanged', self.__transferred_bytes_changed_cb)
+        self.channel[
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER].connect_to_signal(
+                'InitialOffsetDefined', self.__initial_offset_defined_cb)
 
         channel_properties = self.channel[dbus.PROPERTIES_IFACE]
 
-        props = channel_properties.GetAll(CHANNEL_TYPE_FILE_TRANSFER)
+        props = channel_properties.GetAll(TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER)
         self._state = props['State']
         self.filename = props['Filename']
         self.file_size = props['Size']
@@ -479,7 +490,7 @@ class _BaseFileTransfer(GObject.GObject):
 
         Spec:  http://telepathy.freedesktop.org/spec/Channel.html#Method:Close
         '''
-        self.channel[CHANNEL].Close()
+        self.channel[TelepathyGLib.IFACE_CHANNEL].Close()
 
 
 class IncomingFileTransfer(_BaseFileTransfer):
@@ -499,7 +510,7 @@ class IncomingFileTransfer(_BaseFileTransfer):
     def __init__(self, connection, object_path, props):
         _BaseFileTransfer.__init__(self)
 
-        channel = Channel(connection.bus_name, object_path)
+        channel = Channel.new(connection.bus_name, object_path)
         self.set_channel(channel)
 
         self.connect('notify::state', self.__notify_state_cb)
@@ -534,10 +545,10 @@ class IncomingFileTransfer(_BaseFileTransfer):
         self._accept()
 
     def _accept(self):
-        channel_ft = self.channel[CHANNEL_TYPE_FILE_TRANSFER]
+        channel_ft = self.channel[TelapthyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER]
         self._socket_address = channel_ft.AcceptFile(
-            SOCKET_ADDRESS_TYPE_UNIX,
-            SOCKET_ACCESS_CONTROL_LOCALHOST,
+            TelepathyGLib.SocketAddressType.UNIX,
+            TelepathyGLib.SocketAccessControl.LOCALHOST,
             '',
             0,
             byte_arrays=True)
@@ -606,19 +617,30 @@ class _BaseOutgoingTransfer(_BaseFileTransfer):
 
     def _create_channel(self, file_size):
         object_path, properties_ = self._conn.CreateChannel(dbus.Dictionary({
-            CHANNEL + '.ChannelType': CHANNEL_TYPE_FILE_TRANSFER,
-            CHANNEL + '.TargetHandleType': CONNECTION_HANDLE_TYPE_CONTACT,
-            CHANNEL + '.TargetHandle': self.buddy.contact_handle,
-            CHANNEL_TYPE_FILE_TRANSFER + '.Filename': self._filename,
-            CHANNEL_TYPE_FILE_TRANSFER + '.Description': self._description,
-            CHANNEL_TYPE_FILE_TRANSFER + '.Size': file_size,
-            CHANNEL_TYPE_FILE_TRANSFER + '.ContentType': self._mime,
-            CHANNEL_TYPE_FILE_TRANSFER + '.InitialOffset': 0}, signature='sv'))
+            TelepathyGLib.IFACE_CHANNEL + '.ChannelType':
+                CHANNEL_TYPE_FILE_TRANSFER,
+            TelepathyGLib.IFACE_CHANNEL + '.TargetHandleType':
+                CONNECTION_HANDLE_TYPE_CONTACT,
+            TelepathyGLib.IFACE_CHANNEL + '.TargetHandle':
+                self.buddy.contact_handle,
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER +
+                '.Filename': self._filename,
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER +
+                '.Description': self._description,
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER +
+                '.Size': file_size,
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER +
+                '.ContentType': self._mime,
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER +
+                '.InitialOffset': 0}, signature='sv'))
         self.set_channel(Channel(self._conn.bus_name, object_path))
 
-        channel_file_transfer = self.channel[CHANNEL_TYPE_FILE_TRANSFER]
+        channel_file_transfer = self.channel[
+            TelepathyGLib.IFACE_CHANNEL_TYPE_FILE_TRANSFER]
         self._socket_address = channel_file_transfer.ProvideFile(
-            SOCKET_ADDRESS_TYPE_UNIX, SOCKET_ACCESS_CONTROL_LOCALHOST, '',
+            TelepathyGLib.SocketAddressType.UNIX,
+            TelepathyGLib.SocketAccessControl.LOCALHOST,
+            '',
             byte_arrays=True)
 
     def _get_input_stream(self):
@@ -694,7 +716,7 @@ class _TextChannelWrapper(object):
         self._text_chan = text_chan
         self._conn = conn
         self._signal_matches = []
-        m = self._text_chan[CHANNEL_INTERFACE].connect_to_signal(
+        m = self._text_chan[TelepathyGLib.IFACE_CHANNEL_INTERFACE].connect_to_signal(
             'Closed', self._closed_cb)
         self._signal_matches.append(m)
 
@@ -708,8 +730,8 @@ class _TextChannelWrapper(object):
         _logger.debug('sending %s' % text)
 
         if self._text_chan is not None:
-            self._text_chan[CHANNEL_TYPE_TEXT].Send(
-                CHANNEL_TEXT_MESSAGE_TYPE_NORMAL, text)
+            self._text_chan[TelepathyGLib.IFACE_CHANNEL_TYPE_TEXT].Send(
+                ChannelTextMessageType.NORMAL, text)
 
     def close(self):
         '''Close the text channel.'''
@@ -722,7 +744,7 @@ class _TextChannelWrapper(object):
 
     def _closed_cb(self):
         '''Clean up text channel.'''
-        for match in self._signal_matches:
+        for match in self.signal_matches:
             match.remove()
         self._signal_matches = []
         self._text_chan = None
@@ -737,15 +759,16 @@ class _TextChannelWrapper(object):
         if self._text_chan is None:
             return
         self._activity_cb = callback
-        m = self._text_chan[CHANNEL_TYPE_TEXT].connect_to_signal(
-            'Received', self._received_cb)
+        m = self._text_chan[
+            TelepathyGLib.IFACE_CHANNEL_TYPE_TEXT].connect_to_signal(
+                'Received', self._received_cb)
         self._signal_matches.append(m)
 
     def handle_pending_messages(self):
         '''Get pending messages and show them as received.'''
         for identity, timestamp, sender, type_, flags, text in \
             self._text_chan[
-                CHANNEL_TYPE_TEXT].ListPendingMessages(False):
+                TelepathyGLib.IFACE_CHANNEL_TYPE_TEXT].ListPendingMessages(False):
             self._received_cb(identity, timestamp, sender, type_, flags, text)
 
     def _received_cb(self, identity, timestamp, sender, type_, flags, text):
@@ -763,11 +786,11 @@ class _TextChannelWrapper(object):
 
         if self._activity_cb:
             try:
-                self._text_chan[CHANNEL_INTERFACE_GROUP]
+                self._text_chan[TelepathyGLib.IFACE_CHANNEL_INTERFACE_GROUP]
             except Exception:
                 # One to one XMPP chat
                 nick = self._conn[
-                    CONN_INTERFACE_ALIASING].RequestAliases([sender])[0]
+                    TelepathyGLib.IFACE_CONNECTION_INTERFACE_ALIASING].RequestAliases([sender])[0]
                 buddy = {'nick': nick, 'color': '#000000,#808080'}
                 _logger.debug('exception: recieved from sender %r buddy %r' %
                               (sender, buddy))
@@ -779,7 +802,7 @@ class _TextChannelWrapper(object):
 
             self._activity_cb(buddy, msg)
             self._text_chan[
-                CHANNEL_TYPE_TEXT].AcknowledgePendingMessages([identity])
+                TelepathyGLib.IFACE_CHANNEL_TYPE_TEXT].AcknowledgePendingMessages([identity])
         else:
             _logger.debug('Throwing received message on the floor'
                           ' since there is no callback connected. See'
@@ -804,13 +827,13 @@ class _TextChannelWrapper(object):
 
         # Get the Telepathy Connection
         tp_name, tp_path = pservice.get_preferred_connection()
-        conn = Connection(tp_name, tp_path)
-        group = self._text_chan[CHANNEL_INTERFACE_GROUP]
+        conn = Connection.new(TelepathyGLib.DBuxDeamon.dup(), tp_name, tp_path)
+        group = self._text_chan[TelepathyGLib.IFACE_CHANNEL_INTERFACE_GROUP]
         my_csh = group.GetSelfHandle()
         if my_csh == cs_handle:
             handle = conn.GetSelfHandle()
         elif (group.GetGroupFlags() &
-              CHANNEL_GROUP_FLAG_CHANNEL_SPECIFIC_HANDLES):
+              TelepathyGLib.ChannelGroupFlags.CHANNEL_SPECIFIC_HANDLES):
             handle = group.GetHandleOwners([cs_handle])[0]
         else:
             handle = cs_handle
